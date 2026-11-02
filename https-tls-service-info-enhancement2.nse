@@ -1,89 +1,170 @@
-description = [[
-HTTPS/TLS Service Information
 
-Connects to an HTTPS/TLS service and displays TLS connection information.
+local sslcert = require "sslcert"
+local shortport = require "shortport"
+
+description = [[
+Retrieves HTTPS certificate information and analyzes
+certificate expiry and remaining validity days.
 ]]
+
 author = "Abhinav Mishra"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "safe"}
 
-local nmap = require "nmap"
-local stdnse = require "stdnse"
+portrule = shortport.ssl
 
-portrule = function(host, port)
-    return port.protocol == "tcp" and port.state == "open" and port.number == 443
+-- Convert a calendar date into a day number.
+-- This avoids local timezone conversion problems.
+local function days_from_date(y, m, d)
+
+    y = y - (m <= 2 and 1 or 0)
+
+    local era = math.floor(y / 400)
+    local yoe = y - era * 400
+
+    local mp = m + (m > 2 and -3 or 9)
+    local doy = math.floor((153 * mp + 2) / 5) + d - 1
+
+    local doe = yoe * 365
+        + math.floor(yoe / 4)
+        - math.floor(yoe / 100)
+        + doy
+
+    return era * 146097 + doe
 end
 
+-- Format certificate date.
 local function format_date(date)
-    if not date then return "Unknown" end
-    return string.format("%04d-%02d-%02d %02d:%02d:%02d",
-        date.year or 0, date.month or 0, date.day or 0,
-        date.hour or 0, date.min or 0, date.sec or 0)
+
+    if type(date) == "table" then
+        return string.format(
+            "%04d-%02d-%02d %02d:%02d:%02d",
+            date.year, date.month, date.day,
+            date.hour or 0, date.min or 0, date.sec or 0
+        )
+
+    elseif type(date) == "number" then
+        return os.date("!%Y-%m-%d %H:%M:%S", date)
+
+    else
+        return tostring(date)
+    end
+end
+
+-- Calculate remaining validity in calendar days.
+local function remaining_days(date)
+
+    local today = os.date("!*t")
+
+    local current_day = days_from_date(
+        today.year, today.month, today.day
+    )
+
+    if type(date) == "table" then
+
+        local expiry_day = days_from_date(
+            date.year, date.month, date.day
+        )
+
+        return expiry_day - current_day
+
+    elseif type(date) == "number" then
+
+        return math.floor(date / 86400) - current_day
+    end
+
+    return nil
 end
 
 action = function(host, port)
-    local output = {"HTTPS/TLS Service Information"}
-    local socket = nmap.new_socket()
-    socket:set_timeout(5000)
 
-    -- Base: establish a TLS connection.
-    local status, err = socket:connect(host, port, "ssl")
-    if not status then
-        socket:close()
-        return "TLS connection failed: " .. (err or "unknown error")
+    local status, cert = sslcert.getCertificate(host, port)
+
+    if not status or not cert then
+        return "Unable to retrieve TLS certificate"
     end
-    output[#output + 1] = "Status: TLS connection established"
-    socket:close()
 
-    -- Enhancement 1: measure TLS connection establishment time.
-    socket = nmap.new_socket()
-    socket:set_timeout(5000)
-    local start_time = nmap.clock_ms()
-    local timed_status, timed_error = socket:connect(host, port, "ssl")
-    local end_time = nmap.clock_ms()
-
-    if not timed_status then
-        socket:close()
-        return "TLS connection established\nTLS timing failed: " ..
-               (timed_error or "unknown error")
-    end
+    local output = {}
 
     output[#output + 1] =
-        string.format("TLS connection time: %d ms", end_time - start_time)
+        "TLS certificate retrieved successfully"
 
-    -- Enhancement 2: retrieve TLS certificate information.
-    local certificate = socket:get_ssl_certificate()
-    if certificate then
-        if certificate.subject and certificate.subject.commonName then
-            output[#output + 1] =
-                "Certificate Common Name: " .. certificate.subject.commonName
-        end
-        if certificate.issuer and certificate.issuer.commonName then
-            output[#output + 1] =
-                "Certificate Issuer: " .. certificate.issuer.commonName
-        end
-        if certificate.pubkey then
-            if certificate.pubkey.type then
-                output[#output + 1] = "Public Key Type: " .. certificate.pubkey.type
-            end
-            if certificate.pubkey.bits then
-                output[#output + 1] = "Public Key Bits: " .. certificate.pubkey.bits
-            end
-        end
-        if certificate.validity then
-            if certificate.validity.notBefore then
-                output[#output + 1] =
-                    "Valid From: " .. format_date(certificate.validity.notBefore)
-            end
-            if certificate.validity.notAfter then
-                output[#output + 1] =
-                    "Valid Until: " .. format_date(certificate.validity.notAfter)
-            end
-        end
-    else
-        output[#output + 1] = "Certificate: Not retrieved"
+    -- Certificate subject
+    if cert.subject and cert.subject.commonName then
+        output[#output + 1] =
+            "Certificate subject: " .. cert.subject.commonName
     end
 
-    socket:close()
-    return stdnse.format_output(true, output)
+    -- Certificate issuer
+    if cert.issuer and cert.issuer.commonName then
+        output[#output + 1] =
+            "Certificate issuer: " .. cert.issuer.commonName
+    end
+
+    -- Public key information
+    if cert.pubkey then
+
+        if cert.pubkey.type then
+            output[#output + 1] =
+                "Public key type: " .. cert.pubkey.type
+        end
+
+        if cert.pubkey.bits then
+            output[#output + 1] =
+                "Public key size: " .. cert.pubkey.bits .. " bits"
+        end
+    end
+
+    -- Certificate validity
+    local not_before = cert.validity and cert.validity.notBefore
+    local not_after = cert.validity and cert.validity.notAfter
+
+    if not_before then
+        output[#output + 1] =
+            "Valid from: " .. format_date(not_before)
+    end
+
+    if not_after then
+
+        output[#output + 1] =
+            "Valid until: " .. format_date(not_after)
+
+        local days = remaining_days(not_after)
+
+        if days then
+
+            if days < 0 then
+
+                output[#output + 1] =
+                    "Certificate status: EXPIRED"
+
+                output[#output + 1] =
+                    "Expired " .. math.abs(days) .. " days ago"
+
+            elseif days <= 30 then
+
+                output[#output + 1] =
+                    "Certificate status: EXPIRING SOON"
+
+                output[#output + 1] =
+                    "Remaining validity: " .. days .. " days"
+
+            else
+
+                output[#output + 1] =
+                    "Certificate status: VALID"
+
+                output[#output + 1] =
+                    "Remaining validity: " .. days .. " days"
+            end
+
+        else
+
+            output[#output + 1] =
+                "Expiry analysis unavailable: unsupported date format"
+        end
+    end
+
+    return table.concat(output, "\n")
 end
+
